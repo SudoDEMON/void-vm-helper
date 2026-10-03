@@ -63,6 +63,10 @@ probe_output="$(run_menu_action menu_failure_probe 2>/dev/null)"
 assert_equal "$probe_output" ''
 
 SUDO_CALLS=()
+assert_sudo_call() {
+  if ((EUID == 0)); then assert_equal "${#SUDO_CALLS[@]}" 0
+  else assert_equal "${SUDO_CALLS[0]}" "$1"; fi
+}
 sudo() {
   SUDO_CALLS+=("$*")
   [[ "${1:-}" == -n ]] && shift
@@ -73,15 +77,22 @@ sudo() {
 root_probe_ran=0
 root_probe() { root_probe_ran=1; }
 begin_root_session
-first_keepalive_pid="$SUDO_KEEPALIVE_PID"
-[[ -n "$first_keepalive_pid" ]] || fail 'sudo keepalive did not start'
-kill -0 "$first_keepalive_pid" 2>/dev/null || fail 'sudo keepalive exited unexpectedly'
-begin_root_session
-assert_equal "$SUDO_KEEPALIVE_PID" "$first_keepalive_pid"
-as_root root_probe
+if ((EUID == 0)); then
+  assert_equal "$SUDO_KEEPALIVE_PID" ''
+  begin_root_session
+  as_root root_probe
+  assert_equal "${#SUDO_CALLS[@]}" 0
+else
+  first_keepalive_pid="$SUDO_KEEPALIVE_PID"
+  [[ -n "$first_keepalive_pid" ]] || fail 'sudo keepalive did not start'
+  kill -0 "$first_keepalive_pid" 2>/dev/null || fail 'sudo keepalive exited unexpectedly'
+  begin_root_session
+  assert_equal "$SUDO_KEEPALIVE_PID" "$first_keepalive_pid"
+  as_root root_probe
+  assert_equal "${SUDO_CALLS[0]}" '-n true'
+  assert_equal "${SUDO_CALLS[-1]}" '-n root_probe'
+fi
 assert_equal "$root_probe_ran" 1
-assert_equal "${SUDO_CALLS[0]}" '-n true'
-assert_equal "${SUDO_CALLS[-1]}" '-n root_probe'
 cleanup
 assert_equal "$SUDO_KEEPALIVE_PID" ''
 
@@ -212,7 +223,7 @@ success_log="$supervisor_dir/action-$success_token.log"
 SCRIPT_PATH=/usr/bin/true
 SUDO_CALLS=()
 worker_supervise "$success_token" linux-windows "$supervisor_dir" "$UID" 100 >/dev/null
-assert_equal "${SUDO_CALLS[0]}" "-n setsid /usr/bin/true __worker-run $success_token linux-windows $supervisor_dir $UID"
+assert_sudo_call "-n setsid /usr/bin/true __worker-run $success_token linux-windows $supervisor_dir $UID"
 
 failure_token=supervisor-failure
 failure_log="$supervisor_dir/action-$failure_token.log"
@@ -223,7 +234,7 @@ SUDO_CALLS=()
 if worker_supervise "$failure_token" linux-windows "$supervisor_dir" "$UID" 200 >/dev/null 2>&1; then
   fail 'worker supervisor hid a privileged worker failure'
 fi
-assert_equal "${SUDO_CALLS[0]}" "-n setsid /usr/bin/false __worker-run $failure_token linux-windows $supervisor_dir $UID"
+assert_sudo_call "-n setsid /usr/bin/false __worker-run $failure_token linux-windows $supervisor_dir $UID"
 
 route_token=supervisor-route
 route_log="$supervisor_dir/action-$route_token.log"
@@ -232,13 +243,13 @@ route_log="$supervisor_dir/action-$route_token.log"
 SCRIPT_PATH=/usr/bin/true
 SUDO_CALLS=()
 worker_supervise "$route_token" usb-route "$supervisor_dir" "$UID" 300 --windows 1234:abcd >/dev/null
-assert_equal "${SUDO_CALLS[0]}" \
+assert_sudo_call \
   "-n setsid /usr/bin/true __worker-run $route_token usb-route $supervisor_dir $UID --windows 1234:abcd"
 
 SCRIPT_PATH=/usr/bin/true
 SUDO_CALLS=()
 worker_start linux-windows >"$test_tmp/worker-start.bin"
-assert_equal "${SUDO_CALLS[0]}" '-n true'
+assert_sudo_call '-n true'
 SUDO_CALLS=()
 worker_start check >"$test_tmp/check-start.bin"
 assert_equal "${#SUDO_CALLS[@]}" 0
