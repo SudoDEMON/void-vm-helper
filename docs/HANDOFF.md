@@ -21,11 +21,11 @@ The local `vm-helper.env` is Bash syntax and intentionally ignored. The wizard c
 - `WIN_DISK`: optional stable expected raw block path; when set, it must resolve to a raw disk already attached in inactive VM XML. Every attached raw disk is checked regardless.
 - `GPU_PCI`: selected GPU/companion PCI functions.
 - `GPU_MODULES`: modules needed when returning the GPU to Linux.
-- `USB_DEVICES`: `Label|vendor|product` entries.
+- `USB_DEVICES`: optional startup peripherals as `Label|vendor|product` entries. Missing mouse/keyboard devices must not block startup.
 - `USB_AUTO_DISCOVER`: discover USB hostdevs from inactive VM XML when the array is empty.
 - transition timing and `ALLOW_GUI` values documented in `vm-helper.env.example`.
 
-Legacy `REQUIRED_USB` is mapped to `USB_DEVICES`. `GPU_NODE` is no longer needed because libvirt node names are derived from PCI addresses.
+Legacy `REQUIRED_USB` is mapped to optional `USB_DEVICES`. `GPU_NODE` is no longer needed because libvirt node names are derived from PCI addresses. `GPU_RELEASE_TIMEOUT` bounds GPU-user waits and NVIDIA unload retries (30 seconds by default).
 
 The validated internal configuration endpoint accepts exactly one VM, one display-class GPU BDF, and repeated connected USB VID:PID values. It derives same-slot IOMMU companions and host modules itself, then uses the same locked, backed-up mode-`0600` writer as the classic wizard.
 
@@ -47,16 +47,18 @@ The live USB page consumes additive `usb_route` inventory records. Each record i
 
 - A selected GPU PCI function must exist both on the host and as a persistent VM PCI hostdev.
 - Every attached raw block disk must be online and completely unmounted on Linux.
-- Configured USB devices must be connected before VM startup.
+- Persistent USB sources are made optional before VM startup, with an original XML backup. Missing USB and optional hotplug failures must not stop a successful GPU/VM transition. `scripts/optional-usb.py` only transforms XML; Bash owns backup, validation, and libvirt operations.
 - The display manager is stopped before handing the GPU to the VM.
 - TUI sudo authorization is acquired on the originating TTY. A user-owned, SIGHUP-resistant supervisor must invoke `sudo -n` before `setsid`; the resulting detached worker runs privileged and never prompts after the terminal or USB keyboard is gone. Never reverse that ordering.
 - Active GPU users and busy NVIDIA modules stop the transition.
-- Post-start verification requires every selected PCI function on `vfio-pci`.
+- Post-start verification requires every selected and persistent PCI function on `vfio-pci`, including non-GPU devices such as Wi-Fi adapters.
 - Return-to-Linux skips libvirt reattach for devices already on a host driver. This prevents the fresh-boot reattach bug that can leave NVIDIA half-detached.
 - Return-to-Linux refuses to start the display manager while any selected function remains on `vfio-pci`.
 - The display manager starts only after the returned GPU has a host driver and vendor health checks pass.
 - Guest shutdown remains graceful; no helper uses `virsh destroy`.
 - All GPU, USB, and configuration mutations enter the same `flock`, including nested coexist/USB paths.
+- Keep locked callbacks outside `if`, `!`, and conditional lists: those contexts disable Bash errexit throughout the callback. Safety-critical disk inspection also explicitly rejects failures, even when invoked from a conditional by a caller.
+- A separate `gpu-query.lock` drains existing NVIDIA queries before a mutation and excludes new ones during the transition. The unprivileged launcher creates both lock files before a root worker can use them, preserving user access. Exit cleanup explicitly unlocks inherited descriptors.
 - Per-device USB batches reject missing devices, duplicate VID:PID assignments, Linux root hubs, and ambiguous identical devices before the first mutation. Operational failures may leave earlier requested routes applied; log that partial result and do not add automatic rollback.
 - TUI privileged workers are detached session leaders watched by unprivileged supervisors. Supervisors atomically maintain user-owned binary metadata and text logs below `$XDG_RUNTIME_DIR/vm-helper/` with mode `0600`; closing curses must never signal or cancel them.
 
@@ -65,6 +67,20 @@ The live USB page consumes additive `usb_route` inventory records. Each record i
 NVIDIA module handling is explicit because its DRM/UVM/modeset stack must be unloaded in dependency order before passthrough and reloaded in dependency order afterward. AMD and Intel host modules are inferred for return-to-Linux, but they are not globally unloaded before VM start because the same module may also own the host iGPU. For those vendors, libvirt performs per-device detach and reports a busy device normally.
 
 ## Troubleshooting
+
+### Wi-Fi and Bluetooth
+
+PCI Wi-Fi is supported as an additional persistent managed PCI hostdev in the VM definition. Keep `GPU_PCI` limited to the selected GPU and its companions. The helper discovers other persistent PCI devices, checks their complete IOMMU groups before stopping the desktop, verifies VFIO ownership after startup, and reattaches them on return to Linux.
+
+A Wi-Fi adapter sharing its IOMMU group with host-owned Ethernet, storage, or USB controllers cannot be handed over independently. A down or unused Wi-Fi interface does not resolve that isolation constraint. Inspect the group with `ls -l /sys/bus/pci/devices/<BDF>/iommu_group/devices/`. Do not detach the host's other devices to work around the check.
+
+A USB Bluetooth adapter can use the ordinary USB configuration and routing pages once Linux enumerates it. An absent adapter cannot be selected or passed through; the USB label of a wireless keyboard does not identify a Bluetooth controller.
+
+### Startup and recovery
+
+Windows and Linux transitions poll VM state with a separately initialized deadline. Cover actual cold startup and graceful shutdown paths in regression tests; testing only already-running coexist mode will miss failures between the libvirt operation and desktop restoration.
+
+When a USB policy backup is needed, it is saved next to `VM_MANAGER_CONFIG` as `<config>.bak.domain-*`. Restore a reviewed backup with `virsh -c <URI> define <backup> --validate` while the VM is stopped. Future helper starts will make USB optional again.
 
 Use the read-only report first:
 
@@ -89,7 +105,7 @@ Dynamic snapshots and static inventory run as separate pollable subprocess group
 
 ## Validation Additions
 
-`tests/vm-helper-test.sh` covers binary protocol framing, internal argument validation, per-device USB safety, shared mutation locking, sudo-before-`setsid` worker supervision, user-owned completion metadata, and direct-command dispatch. `tests/test_tui_unit.py` covers parsing, deltas, sparklines, modes, layouts, input/mouse mapping, wizard/USB page state, non-blocking calls, outcome labels, and detached-log reconnection. `tests/test_tui_pty.py` exercises `TERM=linux` at 80x24, `xterm-256color` at 140x40, resize/redraw/navigation, dashboard Activity Log streaming, staged USB routing, slow-telemetry input responsiveness, classic fallback, clean exit, and terminal restoration. `tests/fake-vm-helper` never touches real devices.
+`tests/vm-helper-test.sh` covers binary protocol framing, internal argument validation, per-device USB safety, shared mutation locking, sudo-before-`setsid` worker supervision, user-owned completion metadata, and direct-command dispatch. `tests/test_backend_transitions.py` exercises real transition control flow with mocked device operations: cold starts, graceful shutdown, missing/failed USB, disk inspection failures, DRM user detection, bounded release/unload waits, PCI discovery/isolation, XML backups, and concurrent GPU query locking. `tests/test_tui_unit.py` covers parsing, deltas, sparklines, modes, layouts, input/mouse mapping, wizard/USB page state, non-blocking calls, outcome labels, and detached-log reconnection. `tests/test_tui_pty.py` exercises `TERM=linux` at 80x24, `xterm-256color` at 140x40, resize/redraw/navigation, dashboard Activity Log streaming, staged USB routing, slow-telemetry input responsiveness, classic fallback, clean exit, and terminal restoration. `tests/fake-vm-helper` never touches real devices.
 
 ## Repository Hygiene
 

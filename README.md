@@ -2,7 +2,7 @@
 
 `vm-helper` combines a persistent Python `curses` dashboard with one safety-critical Bash backend for switching a Linux host and a libvirt VM around passed-through GPU and USB devices. The dashboard uses only the Python standard library; every ownership check and mutation remains in `vm-helper`. Familiar legacy command names remain symlinks to that backend.
 
-The tool does not create or edit a Windows VM. The libvirt domain must already exist, and its selected GPU PCI functions must be persistent managed host devices. Both raw-block and file-backed VM disks are supported.
+The libvirt domain must already exist, and its selected GPU PCI functions must be persistent managed host devices. Both raw-block and file-backed VM disks are supported. Before startup, the helper backs up the domain XML and makes persistent USB host devices optional so a disconnected keyboard, mouse, or other USB peripheral cannot block Windows.
 
 ## Start
 
@@ -59,7 +59,7 @@ Keyboard controls:
 
 Mouse selection and log-wheel scrolling are enabled when the terminal reports mouse events. Keyboard operation is always available.
 
-`check` is a read-only transition preflight. It validates persistent PCI hostdev membership, PCI driver consistency, raw-disk safety, configured USB presence, and vendor GPU health without changing ownership.
+`check` is a read-only transition preflight. It validates persistent managed PCI hostdev membership, IOMMU group isolation, PCI driver consistency, raw-disk safety, and vendor GPU health. Missing USB peripherals produce warnings.
 
 Actions stay on the dashboard and stream into Activity Log. The header and persistent status row distinguish `RUNNING`, `SUCCEEDED`, `FAILED (exit N)`, and a stopped worker with incomplete metadata; the separate footer row always keeps navigation help visible. Closing the dashboard never cancels a detached action.
 
@@ -82,6 +82,7 @@ The tool reads live host and libvirt state instead of assuming a 4090, fixed PCI
 
 - VM domains come from `virsh` and are auto-selected when only one exists.
 - GPU PCI functions come from display-class managed host devices in inactive VM XML, parsed with XPath.
+- Additional persistent PCI hostdevs, such as Wi-Fi adapters, are discovered separately and included in isolation and ownership checks. Add them to the domain as managed PCI host devices; do not put them in `GPU_PCI`.
 - The configuration wizard lists every display GPU, current driver, companion function in its IOMMU group, and IOMMU group number.
 - Host GPU modules are inferred for NVIDIA, AMD, and Intel devices.
 - CPU model/topology and current VM vCPU pinning are displayed from `lscpu` and `virsh vcpupin`.
@@ -101,11 +102,11 @@ For multiple VMs or explicit hardware choices, run the full-screen wizard:
 ./vm-helper configure
 ```
 
-The in-app wizard selects a libvirt domain, reviews a GPU with its companion functions/IOMMU state, reviews attached raw disks, multi-selects the default USB devices for Windows startup, and shows persistence warnings, CPU pinning, and transition timers before writing. Its validated Bash endpoint writes ignored, mode-`0600` `vm-helper.env` and backs up an existing file before replacement. It does not edit libvirt XML. `vm-helper.env.example` documents every override. The former `REQUIRED_USB` array remains accepted for compatibility.
+The in-app wizard selects a libvirt domain, reviews a GPU with its companion functions/IOMMU state, reviews attached raw disks, multi-selects optional USB devices for Windows startup, and shows persistence warnings, CPU pinning, and transition timers before writing. Its validated Bash endpoint writes ignored, mode-`0600` `vm-helper.env` and backs up an existing file before replacement. The wizard does not edit libvirt XML; the startup path separately prepares the optional USB policy. `vm-helper.env.example` documents every override. The former `REQUIRED_USB` array remains accepted as optional startup USB for compatibility.
 
 ## Modes
 
-`Windows` (`windows`) validates the VM, selected PCI hostdevs, every raw VM disk, USB presence, GUI state, and PCI driver consistency. It stops the display manager, checks GPU users, safely unloads the NVIDIA stack when applicable, starts the VM, verifies every GPU function reached `vfio-pci`, and live-attaches configured USB devices. Linux remains at TTY.
+`Windows` (`windows`) validates the VM, all persistent PCI hostdevs, every raw VM disk, GUI state, and PCI driver consistency. It stops the display manager, waits up to `GPU_RELEASE_TIMEOUT` for GPU users to exit, safely unloads the NVIDIA stack with bounded retries when applicable, starts the VM, verifies every passed-through PCI function reached `vfio-pci`, and attempts to attach present configured USB devices. Missing or failed optional USB attachments are logged without aborting startup. Linux remains at TTY. Repeating the command for a running VM verifies ownership and retries optional USB setup without starting the VM again.
 
 `Linux + Windows` (`linux-windows`, also `coexist` or `both`) performs the Windows transition, waits for readiness, then starts the Linux display manager on the remaining host GPU or iGPU.
 
@@ -115,13 +116,14 @@ The in-app wizard selects a libvirt domain, reviews a GPU with its companion fun
 
 - Run GPU transitions from TTY or SSH. Graphical-session execution is rejected unless `ALLOW_GUI=1`.
 - Mutating TUI modes acquire sudo on the originating TTY, then a user-owned supervisor invokes `sudo -n` before `setsid` starts the detached privileged worker. The worker therefore needs no later password prompt after USB/terminal handoff. An expired ticket rejects the launch before device ownership changes and selecting the action again reopens authorization.
-- Every raw VM disk must exist, remain unmounted on Linux, and not report `offline`. A configured `WIN_DISK` must resolve to one of those attached disks.
+- Every raw VM disk must exist, remain unmounted on Linux, and not report `offline`. Failed state or mount inspection blocks startup. A configured `WIN_DISK` must resolve to one of those attached disks.
 - Every selected GPU function must already exist in the VM's persistent PCI hostdev configuration.
-- Missing configured USB devices stop VM startup before display-manager shutdown.
+- Missing USB peripherals never block startup. The original persistent domain XML is saved to a mode-`0600` `vm-helper.env.bak.domain-*` file before its USB sources become optional. `./vm-helper usb prepare` performs this preparation separately while the VM is stopped. Explicit live USB routing still requires a present, unambiguous non-hub device.
 - Inconsistent PCI state, including a stale uevent driver without a sysfs driver link, stops immediately with reboot guidance.
 - NVIDIA module unload failure is a hard stop before libvirt can partially detach a busy GPU.
 - Graceful guest shutdown is the default. The tool never calls `virsh destroy`.
 - GPU transitions, bulk and per-device USB mutations, and configuration writes share a non-blocking `flock`; CLI, classic-menu, and TUI operations cannot overlap. A staged USB batch validates every device before changing any, logs each result, and reports partial failure without attempting an unsafe automatic rollback.
+- NVIDIA telemetry uses a separate shared lock. Transitions wait for existing queries to finish and exclude new queries until ownership changes finish.
 - The TUI briefly suspends curses for `sudo -v`, then starts the user-owned supervisor described above. Closing the TUI, terminal, or SSH session does not cancel its detached privileged worker, and there is deliberately no unsafe process-cancel action.
 
 ## Runtime Files
@@ -135,7 +137,7 @@ When `$XDG_RUNTIME_DIR` is unavailable, the helper uses `/run/user/$UID` when pr
 Required host commands:
 
 - Bash 5+
-- Python 3 with standard-library `curses` for the TUI
+- Python 3 for optional USB XML preparation; standard-library `curses` for the TUI
 - `flock` (normally from util-linux)
 - `sudo` for non-root GPU ownership transitions
 - `virsh` and a working system libvirt connection
@@ -148,9 +150,11 @@ Firmware IOMMU support and suitable device isolation are still prerequisites. Th
 ## Validation
 
 ```bash
-bash -n vm-helper vm-gpu-manager windows4090 linux4090 linux-vm linuxvm usb-vm-helper scripts/*.sh
+for script in vm-helper vm-gpu-manager windows4090 linux4090 linux-vm linuxvm usb-vm-helper tests/*.sh; do
+  bash -n "$script" || exit
+done
 bash tests/vm-helper-test.sh
-python3 -m unittest -v tests/test_tui_unit.py tests/test_tui_pty.py
+python3 -m unittest -v tests/test_backend_transitions.py tests/test_tui_unit.py tests/test_tui_pty.py
 ./vm-helper --help
 ./vm-helper hardware
 ./vm-helper status
@@ -165,3 +169,4 @@ If the screen is garbled, confirm `TERM` matches the client (`linux` on a raw co
 ## Handoff
 
 See `docs/HANDOFF.md` for adaptation and troubleshooting notes.
+See `docs/BOOT-ORDER.md` for Limine, bare-metal Windows, and motherboard boot-order behavior.
