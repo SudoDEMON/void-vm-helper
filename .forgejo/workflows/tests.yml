@@ -1,0 +1,30 @@
+name: VM helper tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: linux-cpu
+    steps:
+      - uses: https://github.com/actions/checkout@v6
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxml2-utils pciutils
+      - name: Check Bash syntax
+        run: |
+          for script in vm-helper vm-gpu-manager windows4090 linux4090 linux-vm linuxvm usb-vm-helper tests/*.sh; do
+            bash -n "$script" || exit
+          done
+      - name: Run Bash and Python regressions
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          bash tests/vm-helper-test.sh
+          python3 -m unittest -v tests/test_backend_transitions.py tests/test_tui_unit.py tests/test_tui_pty.py

@@ -170,3 +170,10 @@ If the screen is garbled, confirm `TERM` matches the client (`linux` on a raw co
 
 See `docs/HANDOFF.md` for adaptation and troubleshooting notes.
 See `docs/BOOT-ORDER.md` for Limine, bare-metal Windows, and motherboard boot-order behavior.
+
+## Local CI migration
+
+The `.forgejo/workflows/` checks run on the isolated Linux worker with one job
+at a time. GitHub workflows stay available until the matching Forgejo checks
+pass; GitHub remains the issue, pull-request and release archive. Build jobs
+do not receive production deployment credentials.

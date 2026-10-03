@@ -306,5 +306,58 @@ pci_group_conflicts 0000:09:00.0
                     process.communicate()
 
 
+    def test_unmanaged_pci_cannot_pass_membership_check(self):
+        for managed, expected in (("yes", 0), ("no", 1)):
+            self.bash(f"""
+VM_XML='<domain><devices><hostdev type="pci" managed="{managed}"><source><address domain="0x0000" bus="0x01" slot="0x00" function="0x0"/></source></hostdev></devices></domain>'
+vm_has_pci_hostdev 0000:01:00.0
+""", expected=expected)
+
+    def test_failed_preflight_stops_before_desktop_or_vm_mutation(self):
+        result = self.bash(TRANSITION + r"""
+check_raw_disks() { die "fixture disk blocked"; }
+start_windows_mode
+""", expected=1)
+        self.assertIn("fixture disk blocked", result.stderr)
+        self.assertFalse((self.directory / "events").exists())
+
+    def test_start_timeout_does_not_start_host_desktop(self):
+        result = self.bash(TRANSITION + r"""
+virsh() { event vm-start; printf paused >"$PROBE_DIR/state"; }
+start_coexist_mode
+""", expected=1)
+        self.assertIn("did not reach running state", result.stderr)
+        self.assertNotIn("desktop-start", self.events())
+
+    def test_vfio_ownership_blocks_desktop_after_guest_shutdown(self):
+        result = self.bash(TRANSITION + r"""
+printf running >"$PROBE_DIR/state"
+driver_for() { printf vfio-pci; }
+reattach_if_needed() { event reattach-failed; }
+return_linux_mode
+""", expected=1)
+        self.assertIn("refusing to start the desktop", result.stderr)
+        self.assertNotIn("desktop-start", self.events())
+
+    def test_state_query_error_ends_wait(self):
+        self.bash('domstate() { return 1; }\nwait_for_state running 30\n', expected=1)
+
+    def test_changed_domain_definition_is_never_overwritten(self):
+        result = self.bash(r"""
+CONFIG_FILE="$PROBE_DIR/vm-helper.env"
+VM=test
+VM_XML='<domain><devices><hostdev type="usb"><source/></hostdev></devices></domain>'
+required_domstate() { printf 'shut off'; }
+virsh() {
+  if [[ "$3" == dumpxml ]]; then printf '<domain><name>changed</name></domain>'
+  else printf UNSAFE_DEFINE; fi
+}
+with_mutation_lock prepare_usb_startup
+""", expected=1)
+        self.assertIn("definition changed", result.stderr)
+        self.assertNotIn("UNSAFE_DEFINE", result.stdout)
+        self.assertEqual(list(self.directory.glob("vm-helper.env.bak.domain-*")), [])
+
+
 if __name__ == "__main__":
     unittest.main()
